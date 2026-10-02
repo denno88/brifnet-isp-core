@@ -1,4 +1,3 @@
-import { createHmac } from "node:crypto";
 import { createServer } from "node:http";
 
 import express from "express";
@@ -15,13 +14,33 @@ import {
   createWebhooksRouter,
 } from "../../routes/webhooks.js";
 
-function createSignature(
-  body: string,
-  secret: string,
-): string {
-  return createHmac("sha256", secret)
-    .update(Buffer.from(body))
-    .digest("hex");
+import {
+  createWebhookSignature,
+} from "../../security/webhook-signature.js";
+
+const WEBHOOK_SECRET =
+  "test-webhook-secret";
+
+function createWebhookTimestamp(): string {
+  return new Date().toISOString();
+}
+
+function createWebhookHeaders(
+  rawBody: string,
+  timestamp = createWebhookTimestamp(),
+) {
+  const signature =
+    createWebhookSignature(
+      timestamp,
+      Buffer.from(rawBody, "utf8"),
+      WEBHOOK_SECRET,
+    );
+
+  return {
+    "X-BrifNet-Timestamp": timestamp,
+    "X-BrifNet-Signature":
+      `sha256=${signature}`,
+  };
 }
 
 function createTestApp(
@@ -33,10 +52,11 @@ function createTestApp(
   const app = express();
 
   /*
-   * Webhook signatures are calculated from the exact bytes
-   * sent by the gateway.
+   * The webhook signature covers the exact raw HTTP body.
    *
-   * Capture those bytes before Express parses the JSON.
+   * Express normally parses JSON before the route receives it,
+   * so capture the raw bytes while express.json() processes the
+   * request.
    */
   app.use(
     express.json({
@@ -89,8 +109,7 @@ async function startTestServer(
   const server = createServer(app);
 
   /*
-   * unref() prevents this test server from keeping the
-   * Node/Vitest process alive after the test finishes.
+   * Prevent the test server from keeping the Vitest process alive.
    */
   server.unref();
 
@@ -102,7 +121,10 @@ async function startTestServer(
 
   const address = server.address();
 
-  if (!address || typeof address === "string") {
+  if (
+    !address ||
+    typeof address === "string"
+  ) {
     server.close();
 
     throw new Error(
@@ -110,16 +132,16 @@ async function startTestServer(
     );
   }
 
-  const { port } = address;
+  const { port } =
+    address as AddressInfo;
 
   return {
     url: `http://127.0.0.1:${port}`,
 
     close: () => {
       /*
-       * We have already received and asserted the HTTP response.
-       * There is no reason for the test to wait for keep-alive
-       * sockets to disappear.
+       * The response has already been received, so there is no
+       * reason for the test to wait for keep-alive connections.
        */
       server.closeAllConnections();
       server.close();
@@ -128,301 +150,352 @@ async function startTestServer(
 }
 
 describe("POST /webhooks/payment", () => {
-  const secret = "test-webhook-secret";
-
   const validStkPayload = {
     event_id: "evt-001",
     event: "payment.completed",
-    occurred_at: "2026-09-28T10:00:00+03:00",
+    occurred_at:
+      "2026-10-02T00:15:30+03:00",
     data: {
       reference: "PAY-001",
       phone: "0729633304",
       amount: 100,
       channel: "STK",
-      provider_reference: "MERCHANT-001",
-      provider_transaction_id: "MPESA-001",
+      provider_reference:
+        "MERCHANT-001",
+      provider_transaction_id:
+        "MPESA-001",
     },
   };
 
-  it("accepts a valid signature and valid payload", async () => {
-    const controller = {
+  it(
+    "accepts a valid signature and valid payload",
+    async () => {
+      const controller = {
         handlePayment: vi.fn(
-            async (_req, res) => {
+          async (_req, res) => {
             res.status(200).json({
-                received: true,
-                payment: {
+              received: true,
+              payment: {
                 id: "payment-001",
                 reference: "PAY-001",
                 status: "COMPLETED",
-                },
+              },
             });
-            },
+          },
         ),
-        };
+      };
 
-    const app = createTestApp(
+      const app = createTestApp(
         controller,
-        secret,
-    );
+        WEBHOOK_SECRET,
+      );
 
-    const testServer =
+      const testServer =
         await startTestServer(app);
 
-    try {
+      try {
         const body =
-        JSON.stringify(validStkPayload);
+          JSON.stringify(
+            validStkPayload,
+          );
 
-        console.log("1. Sending webhook request");
-
-        const response = await fetch(
-        `${testServer.url}/webhooks/payment`,
-        {
-            method: "POST",
-            headers: {
-            "Content-Type": "application/json",
-            "Connection": "close",
-            "X-Webhook-Signature":
-                createSignature(body, secret),
+        const response =
+          await fetch(
+            `${testServer.url}/webhooks/payment`,
+            {
+              method: "POST",
+              headers: {
+                "Content-Type":
+                  "application/json",
+                "Connection": "close",
+                ...createWebhookHeaders(
+                  body,
+                ),
+              },
+              body,
+              signal:
+                AbortSignal.timeout(2_000),
             },
-            body,
-            signal: AbortSignal.timeout(2_000),
-        },
-        );
+          );
 
-        console.log(
-        "2. Received response:",
-        response.status,
-        );
+        expect(
+          response.status,
+        ).toBe(200);
 
-        expect(response.status).toBe(200);
-
-        const responseBody =
-        await response.json();
-
-        console.log(
-        "3. Received response body:",
-        responseBody,
-        );
-
-        expect(responseBody).toEqual({
-        received: true,
-        payment: {
+        expect(
+          await response.json(),
+        ).toEqual({
+          received: true,
+          payment: {
             id: "payment-001",
             reference: "PAY-001",
             status: "COMPLETED",
-        },
+          },
         });
 
-        console.log(
-        "4. Controller calls:",
-        controller.handlePayment.mock.calls,
-        );
+        expect(
+          controller.handlePayment,
+        ).toHaveBeenCalledOnce();
+      } finally {
+        testServer.close();
+      }
+    },
+  );
+
+  it(
+    "rejects an invalid signature with 401",
+    async () => {
+      const controller = {
+        handlePayment: vi.fn(),
+      };
+
+      const app = createTestApp(
+        controller,
+        WEBHOOK_SECRET,
+      );
+
+      const testServer =
+        await startTestServer(app);
+
+      try {
+        const body =
+          JSON.stringify(
+            validStkPayload,
+          );
+
+        const response =
+          await fetch(
+            `${testServer.url}/webhooks/payment`,
+            {
+              method: "POST",
+              headers: {
+                "Content-Type":
+                  "application/json",
+                "X-BrifNet-Timestamp":
+                createWebhookTimestamp(),
+                "X-BrifNet-Signature":
+                  `sha256=${"0".repeat(64)}`,
+              },
+              body,
+            },
+          );
 
         expect(
-        controller.handlePayment,
-        ).toHaveBeenCalledOnce();
+          response.status,
+        ).toBe(401);
 
-        console.log("5. Test assertions complete");
-    } finally {
+        expect(
+          await response.json(),
+        ).toEqual({
+          error:
+            "Invalid webhook signature",
+        });
+
+        expect(
+          controller.handlePayment,
+        ).not.toHaveBeenCalled();
+      } finally {
         testServer.close();
-    }
-    });
+      }
+    },
+  );
 
-  it("rejects an invalid signature with 401", async () => {
-    const controller = {
-      handlePayment: vi.fn(),
-    };
-
-    const app = createTestApp(
-      controller,
-      secret,
-    );
-
-    const testServer =
-      await startTestServer(app);
-
-    try {
-      const body =
-        JSON.stringify(validStkPayload);
-
-      const response = await fetch(
-        `${testServer.url}/webhooks/payment`,
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "X-Webhook-Signature":
-              "invalid-signature",
-          },
-          body,
-        },
-      );
-
-      expect(response.status).toBe(401);
-
-      expect(await response.json()).toEqual({
-        error: "Invalid webhook signature",
-      });
-
-      expect(
-        controller.handlePayment,
-      ).not.toHaveBeenCalled();
-    } finally {
-      testServer.close();
-    }
-  });
-
-  it("rejects a missing signature with 401", async () => {
-    const controller = {
-      handlePayment: vi.fn(),
-    };
-
-    const app = createTestApp(
-      controller,
-      secret,
-    );
-
-    const testServer =
-      await startTestServer(app);
-
-    try {
-      const body =
-        JSON.stringify(validStkPayload);
-
-      const response = await fetch(
-        `${testServer.url}/webhooks/payment`,
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Connection": "close",
-          },
-          body,
-        },
-      );
-
-      expect(response.status).toBe(401);
-
-      expect(await response.json()).toEqual({
-        error: "Invalid webhook signature",
-      });
-
-      expect(
-        controller.handlePayment,
-      ).not.toHaveBeenCalled();
-    } finally {
-      testServer.close();
-    }
-  });
-
-  it("rejects an invalid payload with 422 after signature verification", async () => {
-    const controller = {
-      handlePayment: vi.fn(),
-    };
-
-    const app = createTestApp(
-      controller,
-      secret,
-    );
-
-    const testServer =
-      await startTestServer(app);
-
-    try {
-      const invalidPayload = {
-        ...validStkPayload,
-        data: {
-          ...validStkPayload.data,
-          amount: -100,
-        },
+  it(
+    "rejects a missing signature with 401",
+    async () => {
+      const controller = {
+        handlePayment: vi.fn(),
       };
 
-      const body =
-        JSON.stringify(invalidPayload);
-
-      const response = await fetch(
-        `${testServer.url}/webhooks/payment`,
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "X-Webhook-Signature":
-              createSignature(body, secret),
-          },
-          body,
-        },
+      const app = createTestApp(
+        controller,
+        WEBHOOK_SECRET,
       );
 
-      expect(response.status).toBe(422);
+      const testServer =
+        await startTestServer(app);
 
-      expect(await response.json()).toEqual({
-        error: "Invalid payment webhook payload",
-      });
+      try {
+        const body =
+          JSON.stringify(
+            validStkPayload,
+          );
 
-      expect(
-        controller.handlePayment,
-      ).not.toHaveBeenCalled();
-    } finally {
-      testServer.close();
-    }
-  });
+        const response =
+          await fetch(
+            `${testServer.url}/webhooks/payment`,
+            {
+              method: "POST",
+              headers: {
+                "Content-Type":
+                  "application/json",
+                "X-BrifNet-Timestamp":
+                createWebhookTimestamp(),
+              },
+              body,
+            },
+          );
 
-  it("rejects a tampered body even with the original signature", async () => {
-    const controller = {
-      handlePayment: vi.fn(),
-    };
+        expect(
+          response.status,
+        ).toBe(401);
 
-    const app = createTestApp(
-      controller,
-      secret,
-    );
+        expect(
+          await response.json(),
+        ).toEqual({
+          error:
+            "Missing webhook signature",
+        });
 
-    const testServer =
-      await startTestServer(app);
+        expect(
+          controller.handlePayment,
+        ).not.toHaveBeenCalled();
+      } finally {
+        testServer.close();
+      }
+    },
+  );
 
-    try {
-      const originalBody =
-        JSON.stringify(validStkPayload);
-
-      const tamperedPayload = {
-        ...validStkPayload,
-        data: {
-          ...validStkPayload.data,
-          amount: 9999,
-        },
+  it(
+    "rejects an invalid payload with 422 after signature verification",
+    async () => {
+      const controller = {
+        handlePayment: vi.fn(),
       };
 
-      const tamperedBody =
-        JSON.stringify(tamperedPayload);
+      const app = createTestApp(
+        controller,
+        WEBHOOK_SECRET,
+      );
 
-      const response = await fetch(
-        `${testServer.url}/webhooks/payment`,
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Connection": "close",
-            "X-Webhook-Signature":
-                createSignature(
-                originalBody,
-                secret,
+      const testServer =
+        await startTestServer(app);
+
+      try {
+        const invalidPayload = {
+          ...validStkPayload,
+          data: {
+            ...validStkPayload.data,
+            amount: -100,
+          },
+        };
+
+        const body =
+          JSON.stringify(
+            invalidPayload,
+          );
+
+        const response =
+          await fetch(
+            `${testServer.url}/webhooks/payment`,
+            {
+              method: "POST",
+              headers: {
+                "Content-Type":
+                  "application/json",
+                ...createWebhookHeaders(
+                  body,
                 ),
-          },
-          body: tamperedBody,
-        },
+              },
+              body,
+            },
+          );
+
+        expect(
+          response.status,
+        ).toBe(422);
+
+        expect(
+          await response.json(),
+        ).toEqual({
+          error:
+            "Invalid payment webhook payload",
+        });
+
+        expect(
+          controller.handlePayment,
+        ).not.toHaveBeenCalled();
+      } finally {
+        testServer.close();
+      }
+    },
+  );
+
+  it(
+    "rejects a tampered body even with the original signature",
+    async () => {
+      const controller = {
+        handlePayment: vi.fn(),
+      };
+
+      const app = createTestApp(
+        controller,
+        WEBHOOK_SECRET,
       );
 
-      expect(response.status).toBe(401);
+      const testServer =
+        await startTestServer(app);
 
-      expect(await response.json()).toEqual({
-        error: "Invalid webhook signature",
-      });
+      try {
+        const originalBody =
+          JSON.stringify(
+            validStkPayload,
+          );
 
-      expect(
-        controller.handlePayment,
-      ).not.toHaveBeenCalled();
-    } finally {
-      testServer.close();
-    }
-  });
+        const tamperedPayload = {
+          ...validStkPayload,
+          data: {
+            ...validStkPayload.data,
+            amount: 9999,
+          },
+        };
+
+        const tamperedBody =
+          JSON.stringify(
+            tamperedPayload,
+          );
+
+        /*
+         * The signature belongs to originalBody, but the request
+         * contains tamperedBody. Verification must therefore fail.
+         */
+        const originalHeaders =
+          createWebhookHeaders(
+            originalBody,
+          );
+
+        const response =
+          await fetch(
+            `${testServer.url}/webhooks/payment`,
+            {
+              method: "POST",
+              headers: {
+                "Content-Type":
+                  "application/json",
+                "Connection": "close",
+                ...originalHeaders,
+              },
+              body: tamperedBody,
+            },
+          );
+
+        expect(
+          response.status,
+        ).toBe(401);
+
+        expect(
+          await response.json(),
+        ).toEqual({
+          error:
+            "Invalid webhook signature",
+        });
+
+        expect(
+          controller.handlePayment,
+        ).not.toHaveBeenCalled();
+      } finally {
+        testServer.close();
+      }
+    },
+  );
 });

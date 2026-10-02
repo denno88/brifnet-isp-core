@@ -1,92 +1,155 @@
-import { createHmac } from "node:crypto";
-
 import { describe, expect, it } from "vitest";
 
 import {
+  createWebhookSignature,
   verifyWebhookSignature,
 } from "../../security/webhook-signature.js";
 
-describe("verifyWebhookSignature", () => {
-  const secret = "test-webhook-secret";
+const SECRET = "test-webhook-secret";
+const TIMESTAMP = "2026-10-02T00:15:30+03:00";
+const RAW_BODY = Buffer.from(
+  JSON.stringify({
+    event: "payment.completed",
+    reference: "PAY-CB-040",
+    amount: 500,
+  }),
+  "utf8",
+);
 
-  const body = Buffer.from(
-    JSON.stringify({
-      event: "payment.completed",
-      data: {
-        reference: "PAY-001",
-        amount: 100,
-      },
-    }),
-  );
+describe("webhook signature", () => {
+  it("creates a deterministic signature", () => {
+    const signature = createWebhookSignature(
+      TIMESTAMP,
+      RAW_BODY,
+      SECRET,
+    );
 
-  function sign(body: Buffer): string {
-    return createHmac("sha256", secret)
-      .update(body)
-      .digest("hex");
-  }
-
-  it("accepts a valid signature", () => {
-    const signature = sign(body);
-
-    expect(
-      verifyWebhookSignature(
-        body,
-        signature,
-        secret,
-      ),
-    ).toBe(true);
+    expect(signature).toMatch(/^[a-f0-9]{64}$/);
   });
 
-  it("rejects an invalid signature", () => {
-    expect(
-      verifyWebhookSignature(
-        body,
-        "invalid-signature",
-        secret,
-      ),
-    ).toBe(false);
-  });
-
-  it("rejects a signature generated from a different body", () => {
-    const signature = sign(body);
-
-    const differentBody = Buffer.from(
-      JSON.stringify({
-        event: "payment.completed",
-        data: {
-          reference: "PAY-999",
-          amount: 999,
-        },
-      }),
+  it("verifies a valid signature", () => {
+    const signature = createWebhookSignature(
+      TIMESTAMP,
+      RAW_BODY,
+      SECRET,
     );
 
     expect(
       verifyWebhookSignature(
-        differentBody,
+        TIMESTAMP,
+        RAW_BODY,
         signature,
-        secret,
+        SECRET,
+      ),
+    ).toBe(true);
+  });
+
+  it("verifies a valid signature with the sha256= prefix", () => {
+    const signature = createWebhookSignature(
+      TIMESTAMP,
+      RAW_BODY,
+      SECRET,
+    );
+
+    expect(
+      verifyWebhookSignature(
+        TIMESTAMP,
+        RAW_BODY,
+        `sha256=${signature}`,
+        SECRET,
+      ),
+    ).toBe(true);
+  });
+
+  it("rejects a signature generated with a different secret", () => {
+    const signature = createWebhookSignature(
+      TIMESTAMP,
+      RAW_BODY,
+      "wrong-secret",
+    );
+
+    expect(
+      verifyWebhookSignature(
+        TIMESTAMP,
+        RAW_BODY,
+        signature,
+        SECRET,
       ),
     ).toBe(false);
   });
 
-  it("rejects a missing signature", () => {
+  it("rejects a signature when the body is changed", () => {
+    const signature = createWebhookSignature(
+      TIMESTAMP,
+      RAW_BODY,
+      SECRET,
+    );
+
+    const tamperedBody = Buffer.from(
+      JSON.stringify({
+        event: "payment.completed",
+        reference: "PAY-CB-040",
+        amount: 999,
+      }),
+      "utf8",
+    );
+
     expect(
       verifyWebhookSignature(
-        body,
-        "",
-        secret,
+        TIMESTAMP,
+        tamperedBody,
+        signature,
+        SECRET,
       ),
     ).toBe(false);
   });
 
-  it("rejects a missing secret", () => {
-    const signature = sign(body);
+  it("rejects a signature when the timestamp changes", () => {
+    const signature = createWebhookSignature(
+      TIMESTAMP,
+      RAW_BODY,
+      SECRET,
+    );
 
     expect(
       verifyWebhookSignature(
-        body,
+        "2026-10-02T00:16:30+03:00",
+        RAW_BODY,
         signature,
-        "",
+        SECRET,
+      ),
+    ).toBe(false);
+  });
+
+  it("rejects malformed signatures", () => {
+    expect(
+      verifyWebhookSignature(
+        TIMESTAMP,
+        RAW_BODY,
+        "not-a-valid-signature",
+        SECRET,
+      ),
+    ).toBe(false);
+  });
+
+  it("rejects signatures with an invalid hexadecimal value", () => {
+    expect(
+      verifyWebhookSignature(
+        TIMESTAMP,
+        RAW_BODY,
+        `sha256=${"z".repeat(64)}`,
+        SECRET,
+      ),
+    ).toBe(false);
+  });
+
+  it("rejects an incorrectly sized hexadecimal signature", () => {
+    expect(
+      verifyWebhookSignature(
+        TIMESTAMP,
+        RAW_BODY,
+        `sha256=${"a".repeat(63)}`,
+        SECRET,
       ),
     ).toBe(false);
   });

@@ -36,8 +36,6 @@ const stkPaymentCompletedSchema = z.object({
  * provider_transaction_id remains the financial idempotency key.
  */
 const c2bPaymentCompletedSchema = z.object({
-  reference: z.string().min(1),
-
   account_number: z.string().min(1),
 
   phone: z

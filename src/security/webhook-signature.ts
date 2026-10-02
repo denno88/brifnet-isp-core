@@ -3,45 +3,67 @@ import {
   timingSafeEqual,
 } from "node:crypto";
 
-export function verifyWebhookSignature(
+export function createWebhookSignature(
+  timestamp: string,
   rawBody: Buffer,
-  signature: string,
+  secret: string,
+): string {
+  return createHmac("sha256", secret)
+    .update(
+      `${timestamp}.${rawBody.toString("utf8")}`,
+    )
+    .digest("hex");
+}
+
+export function verifyWebhookSignature(
+  timestamp: string,
+  rawBody: Buffer,
+  suppliedSignature: string,
   secret: string,
 ): boolean {
-  if (!signature || !secret) {
+  const expectedSignature =
+    createWebhookSignature(
+      timestamp,
+      rawBody,
+      secret,
+    );
+
+  const normalizedSignature =
+    suppliedSignature.startsWith("sha256=")
+      ? suppliedSignature.slice(
+          "sha256=".length,
+        )
+      : suppliedSignature;
+
+  if (
+    !/^[a-fA-F0-9]{64}$/.test(
+      normalizedSignature,
+    )
+  ) {
     return false;
   }
 
-  const expectedSignature = createHmac(
-    "sha256",
-    secret,
-  )
-    .update(rawBody)
-    .digest("hex");
+  const expectedBuffer =
+    Buffer.from(
+      expectedSignature,
+      "hex",
+    );
 
-  const received = Buffer.from(
-    signature.trim(),
-    "utf8",
-  );
+  const suppliedBuffer =
+    Buffer.from(
+      normalizedSignature,
+      "hex",
+    );
 
-  const expected = Buffer.from(
-    expectedSignature,
-    "utf8",
-  );
-
-  /*
-   * timingSafeEqual prevents the comparison itself from
-   * leaking useful timing information.
-   *
-   * The length check is required because timingSafeEqual
-   * throws when the buffers have different lengths.
-   */
-  if (received.length !== expected.length) {
+  if (
+    expectedBuffer.length !==
+    suppliedBuffer.length
+  ) {
     return false;
   }
 
   return timingSafeEqual(
-    received,
-    expected,
+    expectedBuffer,
+    suppliedBuffer,
   );
 }

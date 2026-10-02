@@ -4,51 +4,103 @@ import type {
   Response,
 } from "express";
 
-import { AppError } from "../errors/app-error.js";
 import {
   verifyWebhookSignature,
 } from "../security/webhook-signature.js";
+
+const WEBHOOK_TIMESTAMP_TOLERANCE_MS =
+  5 * 60 * 1000;
+
+type RawBodyRequest = Request & {
+  rawBody?: Buffer;
+};
 
 export function createWebhookSignatureMiddleware(
   secret: string,
 ) {
   return (
     req: Request,
-    _res: Response,
+    res: Response,
     next: NextFunction,
-  ) => {
-    const rawBody = (
-      req as Request & {
-        rawBody?: Buffer;
-      }
-    ).rawBody;
+  ): void => {
+    const rawRequest =
+      req as RawBodyRequest;
 
-    if (!rawBody) {
-      return next(
-        new AppError(
-          "Webhook raw body is unavailable",
-          400,
-        ),
-      );
-    }
+    const timestamp =
+      req.get("X-BrifNet-Timestamp");
 
     const signature =
-      req.header("X-Webhook-Signature");
+      req.get("X-BrifNet-Signature");
+
+    if (!timestamp) {
+      res.status(401).json({
+        error:
+          "Missing webhook timestamp",
+      });
+
+      return;
+    }
+
+    if (!signature) {
+      res.status(401).json({
+        error:
+          "Missing webhook signature",
+      });
+
+      return;
+    }
+
+    if (!rawRequest.rawBody) {
+      res.status(400).json({
+        error:
+          "Raw webhook body is unavailable",
+      });
+
+      return;
+    }
+
+    const timestampMs =
+      Date.parse(timestamp);
+
+    if (Number.isNaN(timestampMs)) {
+      res.status(401).json({
+        error:
+          "Invalid webhook timestamp",
+      });
+
+      return;
+    }
+
+    const ageMs =
+      Math.abs(Date.now() - timestampMs);
 
     if (
-      !signature ||
-      !verifyWebhookSignature(
-        rawBody,
+      ageMs >
+      WEBHOOK_TIMESTAMP_TOLERANCE_MS
+    ) {
+      res.status(401).json({
+        error:
+          "Webhook timestamp is outside the allowed window",
+      });
+
+      return;
+    }
+
+    const valid =
+      verifyWebhookSignature(
+        timestamp,
+        rawRequest.rawBody,
         signature,
         secret,
-      )
-    ) {
-      return next(
-        new AppError(
-          "Invalid webhook signature",
-          401,
-        ),
       );
+
+    if (!valid) {
+      res.status(401).json({
+        error:
+          "Invalid webhook signature",
+      });
+
+      return;
     }
 
     next();
